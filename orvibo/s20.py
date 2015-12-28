@@ -6,11 +6,14 @@ import logging
 import socket
 import threading
 import time
+import re
+import copy
 
 _LOGGER = logging.getLogger(__name__)
 
 # S20 UDP port
 PORT = 10000
+PAIR_PORT = 48899    # port S20 listens on for pairing
 
 # UDP best-effort.
 RETRIES = 3
@@ -39,12 +42,44 @@ _SOCKET = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 # Buffer
 _BUFFER = {}
 
+def isprint(c):
+	""" Determine if value is a printable character
+
+	:returns: true if printable
+	"""
+	return c>=32 and c<=126
+
+def dump(byteStr):
+    """format and print binary data to console
+    
+    Sort of like 'hexdump -C'
+    """
+    i=0;
+    charStr=""
+    for x in byteStr:
+        print("{:3x} ".format(x), end='', sep='')
+        if isprint(x):
+            charStr = charStr+chr(x)
+        else:
+            charStr = charStr+'.'
+        i+=1
+        if i == 8:
+            i=0
+            print(" [{}]".format(charStr))
+            charStr = ""
+    if i != 8:
+        print(" [{}]".format(charStr))
+    print("\n ")
+
 
 def _listen():
     """ Listen on socket. """
+    # TODO: Use thread safe queue to hand bufers to main thread
+    # TODO: Determine which messages are from ourselves and drop them
     while True:
         data, addr = _SOCKET.recvfrom(1024)
         _BUFFER[addr[0]] = data
+        dump(data)
 
 
 def _setup():
@@ -91,6 +126,30 @@ def discover(timeout=DISCOVERY_TIMEOUT):
                     hosts[host] = entry
     return hosts
 
+def pair_start(timeout=DISCOVERY_TIMEOUT):
+    """ Start pairing process, sort of a discovery and puts the s20 into pairing mood (?)
+
+    :returns: IP addresses of S20s that replied to pair request
+    """
+    host = '255.255.255.255'
+    retval = []
+    for _ in range(RETRIES):
+        _ACK = {}   # track which replies we've ACKed
+        _SOCKET.sendto(bytearray('HF-A11ASSISTHREAD', 'UTF-8'), (host, PAIR_PORT))
+        start = time.time()
+        while time.time() < start + timeout:
+            #keys = copy.deepcopy(_BUFFER.keys()) # copy because _BUFFER can change while iterating
+            for s20_resp in _BUFFER.copy().keys():
+                if (s20_resp not in retval and 
+                    _is_start_pair_response(_BUFFER[s20_resp]) is not None):
+                    if not s20_resp in _ACK.keys():
+                        _LOGGER.debug("Reply device at %s", s20_resp)
+                        _ACK[s20_resp] = 1
+                        _SOCKET.sendto(bytearray('+ok', 'UTF-8'), (s20_resp, PAIR_PORT))
+                        if s20_resp not in retval:
+                            retval = retval + [(s20_resp)]
+    return retval
+
 
 def _is_discovery_response(data):
     """ Is this a discovery response?
@@ -115,6 +174,30 @@ def _is_control_response(data):
     """
     return data[0:6] == (MAGIC + CONTROL_RESP)
 
+def _is_AT_response(data):
+    """ Is this a response to an AT command?
+
+    :param data: Payload.
+    """
+    return data[0:1] == ('+')
+
+def _is_start_pair_response(data):
+    """ Is this a response to the 'start pair' message
+
+    :param data: Payload.
+    """
+    if data[0:2] == MAGIC: # messages that start with MAGIC cannot be pair response
+        print("not a pair response")
+        return None
+    
+    data =data.decode("utf-8")
+    m = re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}",data)
+    if m is None:
+        print("not a pair response")
+        return None
+    else:
+        print(data, "is a pair response")
+        return m.group();
 
 class S20Exception(Exception):
     """ S20 exception. """
